@@ -1,0 +1,5 @@
+{
+  "name": "Video to Sound AI",
+  "description": "An application that analyzes uploaded videos and generates a corresponding soundtrack of sounds, noises, and voices using AI.",
+  "requestFramePermissions": []
+}
