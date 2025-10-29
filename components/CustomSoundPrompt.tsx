@@ -6,9 +6,9 @@ interface CustomSoundPromptProps {
   disabled: boolean;
 }
 
-const SpeechBubbleIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-purple-400" viewBox="0 0 20 20" fill="currentColor">
-        <path fillRule="evenodd" d="M18 5v8a2 2 0 01-2 2h-5l-5 4v-4H4a2 2 0 01-2-2V5a2 2 0 012-2h12a2 2 0 012 2zM7 8H5v2h2V8zm2 0h2v2H9V8zm6 0h-2v2h2V8z" clipRule="evenodd" />
+const MagicWandIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
     </svg>
 );
 
@@ -17,12 +17,12 @@ export const CustomSoundPrompt: React.FC<CustomSoundPromptProps> = ({ prompt, on
   return (
     <div className="w-full p-4 bg-gray-700/50 rounded-lg">
       <h3 className="font-semibold text-purple-300 mb-3 flex items-center gap-2">
-        <SpeechBubbleIcon />
-        Add a Custom Sound
+        <MagicWandIcon />
+        Guide the AI's Performance
       </h3>
       <input
         type="text"
-        placeholder="e.g., 'a cat purring softly'"
+        placeholder="e.g., 'an angry argument', 'a hushed, conspiratorial tone'"
         value={prompt}
         onChange={(e) => onPromptChange(e.target.value)}
         disabled={disabled}

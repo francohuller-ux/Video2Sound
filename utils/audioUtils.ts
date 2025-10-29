@@ -42,84 +42,95 @@ export async function decodeAudioData(
 }
 
 /**
- * Mixes multiple 16-bit PCM audio tracks into a single track.
- * @param tracks An array of Uint8Arrays, each representing a raw PCM audio track.
- * @returns A new Uint8Array with the mixed audio data.
+ * Converts an AudioBuffer object to a WAV file Blob.
+ * @param buffer The AudioBuffer to convert.
+ * @returns A Blob representing the WAV file.
  */
-export function mixAudio(tracks: Uint8Array[]): Uint8Array {
-  if (tracks.length === 0) return new Uint8Array(0);
-  if (tracks.length === 1) return tracks[0];
+export function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels;
+  const length = buffer.length * numOfChan * 2; // 2 bytes per sample (16-bit)
+  const bufferArray = new ArrayBuffer(44 + length);
+  const view = new DataView(bufferArray);
+  const channels = [];
+  let i, sample;
+  let offset = 0;
+  let pos = 0;
 
-  const int16Tracks = tracks.map(t => new Int16Array(t.buffer, t.byteOffset, t.byteLength / 2));
+  function setUint16(data: number) {
+    view.setUint16(pos, data, true);
+    pos += 2;
+  }
+  function setUint32(data: number) {
+    view.setUint32(pos, data, true);
+    pos += 4;
+  }
 
-  const maxLength = Math.max(...int16Tracks.map(t => t.length));
-  const mixedInt16 = new Int16Array(maxLength);
+  // Write WAVE header
+  setUint32(0x46464952); // "RIFF"
+  setUint32(36 + length); // file length - 8
+  setUint32(0x45564157); // "WAVE"
 
-  for (let i = 0; i < maxLength; i++) {
-    let sampleSum = 0;
-    for (const track of int16Tracks) {
-      if (i < track.length) {
-        sampleSum += track[i];
-      }
+  // Write "fmt " chunk
+  setUint32(0x20746d66); // "fmt "
+  setUint32(16); // chunk size
+  setUint16(1); // format = 1 (PCM)
+  setUint16(numOfChan);
+  setUint32(buffer.sampleRate);
+  setUint32(buffer.sampleRate * 2 * numOfChan); // byte rate
+  setUint16(numOfChan * 2); // block align
+  setUint16(16); // bits per sample
+
+  // Write "data" chunk
+  setUint32(0x61746164); // "data"
+  setUint32(length);
+
+  for (i = 0; i < buffer.numberOfChannels; i++) {
+    channels.push(buffer.getChannelData(i));
+  }
+
+  while (pos < 44 + length) {
+    for (i = 0; i < numOfChan; i++) {
+      sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
+      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
+      view.setInt16(pos, sample, true);
+      pos += 2;
     }
-    // Clamp the sum to the 16-bit integer range to prevent clipping
-    mixedInt16[i] = Math.max(-32768, Math.min(32767, sampleSum));
+    offset++;
   }
 
-  return new Uint8Array(mixedInt16.buffer);
-}
-
-
-function writeString(view: DataView, offset: number, str: string) {
-  for (let i = 0; i < str.length; i++) {
-    view.setUint8(offset + i, str.charCodeAt(i));
-  }
+  return new Blob([view], { type: 'audio/wav' });
 }
 
 /**
- * Creates a WAV file Blob from raw PCM audio data.
- * @param pcmData The raw PCM data.
- * @param sampleRate The sample rate of the audio.
- * @param numChannels The number of channels.
- * @param bitsPerSample The number of bits per sample (e.g., 16).
- * @returns A Blob representing the WAV file.
+ * Stitches multiple audio clips together at specific times on a silent track.
+ * @param clips An array of audio clips with their start times and raw data.
+ * @param totalDuration The total duration of the final audio track in seconds.
+ * @param sampleRate The sample rate for the audio context.
+ * @returns A promise that resolves to a WAV Blob.
  */
-export function createWavBlob(
-  pcmData: Uint8Array,
-  sampleRate: number,
-  numChannels: number,
-  bitsPerSample: number
-): Blob {
-  const dataSize = pcmData.byteLength;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
+export async function stitchAudioClips(
+  clips: { time: number; audioData: Uint8Array }[],
+  totalDuration: number,
+  sampleRate: number = 24000
+): Promise<Blob> {
+  // FIX: Cast window to `any` to allow access to vendor-prefixed `webkitAudioContext` for broader browser compatibility.
+  const tempCtx = new ((window as any).AudioContext || (window as any).webkitAudioContext)({ sampleRate });
+  const offlineCtx = new OfflineAudioContext(1, Math.ceil(totalDuration * sampleRate), sampleRate);
 
-  const blockAlign = (numChannels * bitsPerSample) / 8;
-  const byteRate = sampleRate * blockAlign;
-
-  // RIFF header
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true); // chunkSize
-  writeString(view, 8, 'WAVE');
-
-  // fmt sub-chunk
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // subchunk1Size
-  view.setUint16(20, 1, true); // audioFormat (1 for PCM)
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-
-  // data sub-chunk
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  // Write PCM data from the source Uint8Array
-  for (let i = 0; i < dataSize; i++) {
-    view.setUint8(44 + i, pcmData[i]);
-  }
+  const decodedBuffers = await Promise.all(
+    clips.map(clip => decodeAudioData(clip.audioData, tempCtx, sampleRate, 1))
+  );
   
-  return new Blob([view], { type: 'audio/wav' });
+  decodedBuffers.forEach((buffer, index) => {
+    const source = offlineCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(offlineCtx.destination);
+    source.start(clips[index].time);
+  });
+  
+  const renderedBuffer = await offlineCtx.startRendering();
+  
+  await tempCtx.close();
+  
+  return audioBufferToWavBlob(renderedBuffer);
 }

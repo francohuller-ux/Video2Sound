@@ -1,34 +1,52 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { FileUploader } from './components/FileUploader';
 import { VideoPlayer } from './components/VideoPlayer';
-import { AudioPlayer } from './components/AudioPlayer';
 import { Loader } from './components/Loader';
-import { SoundEffectSelector } from './components/SoundEffectSelector';
-import { VoiceSelector, availableVoices } from './components/VoiceSelector';
 import { CustomSoundPrompt } from './components/CustomSoundPrompt';
-import { generateSoundDescription, generateAudioFromText, suggestSoundEffects } from './services/geminiService';
-import { soundEffects } from './services/soundEffects';
+import { generateDialogueScript, generateAudioForDialogueLine } from './services/geminiService';
 import { fileToBase64 } from './utils/fileUtils';
-import { decode, decodeAudioData, createWavBlob, mixAudio } from './utils/audioUtils';
+import { decode, stitchAudioClips } from './utils/audioUtils';
 
-// Define loading steps for better user feedback
-type LoadingStep = 'Analyzing Video' | 'Generating Sound' | 'Generating Custom Sound' | 'Mixing Audio' | 'Suggesting Sounds' | '';
+type LoadingStep = 'Analyzing Lip Movements' | 'Generating Dialogue Audio' | 'Synchronizing Dialogue' | '';
+
+export interface DialogueLine {
+  time: number;
+  speaker: string;
+  age: string;
+  gender: string;
+  performanceCue: string;
+  text: string;
+}
+
+const PlayIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+);
+
+const PauseIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+);
+
 
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
-  const [generatedAudioBuffer, setGeneratedAudioBuffer] = useState<AudioBuffer | null>(null);
-  const [rawAudioData, setRawAudioData] = useState<Uint8Array | null>(null);
+  const [generatedAudioUrl, setGeneratedAudioUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [loadingStep, setLoadingStep] = useState<LoadingStep>('');
   const [error, setError] = useState<string | null>(null);
-  const [soundDescription, setSoundDescription] = useState<string>('');
-  const [selectedEffects, setSelectedEffects] = useState<string[]>([]);
-  const [suggestedEffects, setSuggestedEffects] = useState<string[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState<string>(availableVoices[0]);
-  const [customSoundPrompt, setCustomSoundPrompt] = useState<string>('');
+  const [dialogueScript, setDialogueScript] = useState<string>('');
+  const [dialogueGuidance, setDialogueGuidance] = useState<string>('');
   const [retryAfter, setRetryAfter] = useState<number>(0);
   const [retryAttempts, setRetryAttempts] = useState<number>(0);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
     if (retryAfter > 0) {
@@ -36,6 +54,29 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, [retryAfter]);
+  
+  useEffect(() => {
+    const videoElement = videoRef.current;
+    const audio = audioRef.current;
+    
+    const handlePlaybackEnd = () => {
+      setIsPlaying(false);
+      if (videoElement) videoElement.currentTime = 0;
+      if (audio) audio.currentTime = 0;
+    };
+    
+    if (videoElement) {
+        videoElement.addEventListener('ended', handlePlaybackEnd);
+        videoElement.addEventListener('pause', () => setIsPlaying(false));
+    }
+
+    return () => {
+        if (videoElement) {
+            videoElement.removeEventListener('ended', handlePlaybackEnd);
+            videoElement.removeEventListener('pause', () => setIsPlaying(false));
+        }
+    };
+  }, []);
 
   const handleFileChange = (file: File) => {
     if (file && file.type.startsWith('video/')) {
@@ -48,84 +89,118 @@ export default function App() {
       setVideoPreviewUrl(null);
     }
   };
+  
+  const parseScript = (script: string): DialogueLine[] => {
+    const lines = script.split('\n');
+    const parsedLines: DialogueLine[] = [];
+    // Updated regex to capture the performance cue, e.g., [shouting]
+    const dialogueRegex = /\[(\d+\.?\d*)\] DIALOGUE: (Speaker \d+): \(([^,]+), ([^)]+)\) \[([^\]]+)\] (.*)/;
 
-  const handleSuggestSounds = useCallback(async () => {
-    if (!videoFile) return;
-
-    setIsLoading(true);
-    setLoadingStep('Suggesting Sounds');
-    setError(null);
-    setSuggestedEffects([]);
-
-    try {
-      const videoBase64 = await fileToBase64(videoFile);
-      const suggestions = await suggestSoundEffects(videoBase64, videoFile.type);
-      setSuggestedEffects(suggestions);
-      setSelectedEffects(suggestions); // Automatically select the suggested effects
-    } catch (err) {
-      console.error(err);
-      let errorMessage = 'Could not suggest sounds. Please try again.';
-      if (err instanceof Error) {
-        errorMessage = `An error occurred while suggesting sounds: ${err.message}`;
+    for (const line of lines) {
+      const dialogueMatch = line.match(dialogueRegex);
+      if (dialogueMatch) {
+        parsedLines.push({
+          time: parseFloat(dialogueMatch[1]),
+          speaker: dialogueMatch[2],
+          age: dialogueMatch[3].trim(),
+          gender: dialogueMatch[4].trim(),
+          performanceCue: dialogueMatch[5].trim(),
+          text: dialogueMatch[6].trim(),
+        });
       }
-      setError(errorMessage);
-    } finally {
-      setIsLoading(false);
-      setLoadingStep('');
     }
-  }, [videoFile]);
+    return parsedLines;
+  };
 
-  const handleGenerateSound = useCallback(async () => {
-    if (!videoFile) return;
+  const getVideoDuration = (videoEl: HTMLVideoElement): Promise<number> => {
+    return new Promise((resolve, reject) => {
+      if (videoEl.duration && isFinite(videoEl.duration)) {
+        resolve(videoEl.duration);
+        return;
+      }
+      if (videoEl.readyState >= 1) {
+          if (videoEl.duration) {
+            resolve(videoEl.duration);
+            return;
+          }
+      }
+      
+      const onLoadedMetadata = () => {
+        videoEl.removeEventListener('loadedmetadata', onLoadedMetadata);
+        if (videoEl.duration && isFinite(videoEl.duration)) {
+          resolve(videoEl.duration);
+        } else {
+          reject(new Error("Could not determine video duration after metadata loaded."));
+        }
+      };
+
+      videoEl.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+      
+      setTimeout(() => {
+          reject(new Error("Timeout waiting for video metadata."));
+      }, 5000);
+    });
+  };
+
+  const handleGenerateDialogue = useCallback(async () => {
+    if (!videoFile || !videoRef.current) return;
 
     setIsLoading(true);
     setError(null);
-    setGeneratedAudioBuffer(null);
-    setSoundDescription('');
-    setRawAudioData(null);
+    if(generatedAudioUrl) URL.revokeObjectURL(generatedAudioUrl);
+    setGeneratedAudioUrl(null);
+    setDialogueScript('');
+    setIsPlaying(false);
 
     try {
-      // Step 1: Analyze video and generate sound description
-      setLoadingStep('Analyzing Video');
+      setLoadingStep('Analyzing Lip Movements');
       const videoBase64 = await fileToBase64(videoFile);
-      const description = await generateSoundDescription(videoBase64, videoFile.type);
-      setSoundDescription(description);
+      const script = await generateDialogueScript(videoBase64, videoFile.type, dialogueGuidance);
+      setDialogueScript(script);
 
-      // Step 2: Generate audio from the description
-      setLoadingStep('Generating Sound');
-      const audioBase64 = await generateAudioFromText(description, selectedVoice);
-      const mainAudioBytes = decode(audioBase64);
+      const parsedLines = parseScript(script);
+
+      if (parsedLines.length === 0) {
+        setError(script.trim() ? `AI could not generate a valid script. Response: "${script}"` : "AI did not detect any dialogue in the video.");
+        setIsLoading(false);
+        setLoadingStep('');
+        return;
+      }
+
+      setLoadingStep('Generating Dialogue Audio');
+      const settledClips = await Promise.all(
+        parsedLines.map(line =>
+          generateAudioForDialogueLine(line)
+            .then(audioBase64 => {
+              if (audioBase64) {
+                return {
+                  time: line.time,
+                  audioData: decode(audioBase64),
+                };
+              }
+              return null;
+            })
+        )
+      );
+
+      const audioClips = settledClips.filter(clip => clip !== null) as { time: number; audioData: Uint8Array }[];
+
+      if (audioClips.length === 0 && parsedLines.length > 0) {
+        setError("Failed to generate audio for any script lines. The script may contain only unsupported text.");
+        setIsLoading(false);
+        setLoadingStep('');
+        return;
+      }
+
+
+      setLoadingStep('Synchronizing Dialogue');
+      const videoDuration = await getVideoDuration(videoRef.current);
       
-      const additionalAudioTracks: Uint8Array[] = [];
+      const audioBlob = await stitchAudioClips(audioClips, videoDuration);
+      const url = URL.createObjectURL(audioBlob);
+      setGeneratedAudioUrl(url);
 
-      // Step 3: Generate custom sound effect if prompt is provided
-      if (customSoundPrompt.trim() !== '') {
-        setLoadingStep('Generating Custom Sound');
-        const customSoundBase64 = await generateAudioFromText(customSoundPrompt, selectedVoice);
-        additionalAudioTracks.push(decode(customSoundBase64));
-      }
-
-      // Step 4: Add selected library sound effects
-      const selectedEffectsBytes = soundEffects
-        .filter(effect => selectedEffects.includes(effect.id))
-        .map(effect => decode(effect.base64));
-      additionalAudioTracks.push(...selectedEffectsBytes);
-
-      let finalAudioBytes = mainAudioBytes;
-
-      // Step 5: Mix all sounds if any were added
-      if (additionalAudioTracks.length > 0) {
-        setLoadingStep('Mixing Audio');
-        const allTracks = [mainAudioBytes, ...additionalAudioTracks];
-        finalAudioBytes = mixAudio(allTracks);
-      }
-
-      // Step 6: Decode final audio data for playback and download
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      setRawAudioData(finalAudioBytes); // Save for download
-      const buffer = await decodeAudioData(finalAudioBytes, audioContext, 24000, 1);
-      setGeneratedAudioBuffer(buffer);
-      setRetryAttempts(0); // Reset attempts on success
+      setRetryAttempts(0);
 
     } catch (err) {
       console.error(err);
@@ -136,10 +211,8 @@ export default function App() {
         if (lowerCaseMessage.includes('quota') || lowerCaseMessage.includes('resource_exhausted') || lowerCaseMessage.includes('429')) {
           const newRetryAttempts = retryAttempts + 1;
           setRetryAttempts(newRetryAttempts);
-          // Exponential backoff (2^n seconds) with jitter, capped at 60 seconds.
           const backoffSeconds = Math.min(60, Math.pow(2, newRetryAttempts) + Math.random());
           const roundedBackoff = Math.ceil(backoffSeconds);
-
           errorMessage = `API rate limit exceeded. Please wait ${roundedBackoff}s before trying again.`;
           setRetryAfter(roundedBackoff);
         } else if (lowerCaseMessage.includes('failed to fetch')) {
@@ -159,49 +232,65 @@ export default function App() {
       setIsLoading(false);
       setLoadingStep('');
     }
-  }, [videoFile, retryAttempts, selectedEffects, selectedVoice, customSoundPrompt]);
+  }, [videoFile, retryAttempts, dialogueGuidance, generatedAudioUrl]);
   
   const handleDownload = () => {
-    if (!rawAudioData) return;
-
-    // The audio is 16-bit PCM, 1 channel, 24000Hz sample rate
-    const blob = createWavBlob(rawAudioData, 24000, 1, 16);
-    const url = URL.createObjectURL(blob);
+    if (!generatedAudioUrl) return;
     const a = document.createElement('a');
     a.style.display = 'none';
-    a.href = url;
-    a.download = 'generated-sound.wav';
+    a.href = generatedAudioUrl;
+    a.download = 'generated-dialogue.wav';
     document.body.appendChild(a);
     a.click();
-    window.URL.revokeObjectURL(url);
     a.remove();
+  };
+  
+  const handlePlayPause = () => {
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    if (video && audio) {
+        if (isPlaying) {
+            video.pause();
+            audio.pause();
+        } else {
+            if (video.ended) { 
+                 video.currentTime = 0;
+                 audio.currentTime = 0;
+            }
+            video.play();
+            audio.play();
+        }
+        setIsPlaying(!isPlaying);
+    }
   };
 
   const resetState = (keepVideo = false) => {
     if (!keepVideo) {
       setVideoFile(null);
+      if(videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
       setVideoPreviewUrl(null);
     }
-    setGeneratedAudioBuffer(null);
+    if (generatedAudioUrl) {
+      URL.revokeObjectURL(generatedAudioUrl);
+    }
+    setGeneratedAudioUrl(null);
     setIsLoading(false);
     setError(null);
-    setSoundDescription('');
-    setSelectedEffects([]);
-    setSuggestedEffects([]);
-    setSelectedVoice(availableVoices[0]);
-    setCustomSoundPrompt('');
+    setDialogueScript('');
+    setDialogueGuidance('');
     setRetryAfter(0);
-    setRawAudioData(null);
     setRetryAttempts(0);
+    setIsPlaying(false);
   };
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center p-4 sm:p-6 md:p-8">
+      <audio ref={audioRef} src={generatedAudioUrl ?? ''} className="hidden" />
       <header className="w-full max-w-4xl mb-6 text-center">
         <h1 className="text-4xl sm:text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-indigo-600">
-          Video to Sound AI
+          Video to Dialogue AI
         </h1>
-        <p className="mt-2 text-lg text-gray-400">Upload a video, let AI create its soundscape, and add your own effects.</p>
+        <p className="mt-2 text-lg text-gray-400">Upload a video, and let AI analyze lip movements to generate synchronized dialogue.</p>
       </header>
 
       <main className="w-full max-w-2xl bg-gray-800 rounded-2xl shadow-2xl p-6 sm:p-8 transition-all duration-300">
@@ -210,40 +299,12 @@ export default function App() {
         ) : (
           <div className="flex flex-col gap-6">
             <div className="w-full aspect-video rounded-lg overflow-hidden bg-black">
-              <VideoPlayer src={videoPreviewUrl!} />
+              <VideoPlayer ref={videoRef} src={videoPreviewUrl!} />
             </div>
             
-            <SoundEffectSelector 
-              effects={soundEffects}
-              selectedEffects={selectedEffects}
-              suggestedEffects={suggestedEffects}
-              onSelectionChange={setSelectedEffects}
-              disabled={isLoading}
-            />
-            
-            <div className="flex justify-center -mt-4">
-              <button
-                onClick={handleSuggestSounds}
-                disabled={isLoading || !videoFile}
-                className="bg-gray-600 hover:bg-gray-500 text-purple-300 text-sm font-semibold py-2 px-4 rounded-lg shadow-md transition-transform transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100 flex items-center gap-2"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                  <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
-                </svg>
-                Suggest Sounds
-              </button>
-            </div>
-
-
-            <VoiceSelector
-              selectedVoice={selectedVoice}
-              onVoiceChange={setSelectedVoice}
-              disabled={isLoading}
-            />
-
             <CustomSoundPrompt
-              prompt={customSoundPrompt}
-              onPromptChange={setCustomSoundPrompt}
+              prompt={dialogueGuidance}
+              onPromptChange={setDialogueGuidance}
               disabled={isLoading}
             />
 
@@ -251,20 +312,29 @@ export default function App() {
 
             {isLoading && <Loader message={`${loadingStep}...`} />}
 
-            {soundDescription && !isLoading && (
-              <div className="p-4 bg-gray-700/50 rounded-lg">
-                <h3 className="font-semibold text-purple-300 mb-2">Generated Sound Script:</h3>
-                <p className="text-gray-300 text-sm italic">{soundDescription}</p>
+            {dialogueScript && !isLoading && (
+              <div className="p-4 bg-gray-700/50 rounded-lg max-h-48 overflow-y-auto">
+                <h3 className="font-semibold text-purple-300 mb-2">Generated Dialogue Script:</h3>
+                <p className="text-gray-300 text-sm whitespace-pre-wrap italic">{dialogueScript}</p>
               </div>
             )}
             
-            {generatedAudioBuffer && !isLoading && (
-              <AudioPlayer audioBuffer={generatedAudioBuffer} />
+            {generatedAudioUrl && !isLoading && (
+              <div className="flex items-center justify-center p-4 bg-gray-700 rounded-lg w-full">
+                <button
+                  onClick={handlePlayPause}
+                  className="flex items-center gap-2 px-6 py-2 text-lg font-semibold rounded-full bg-purple-600 hover:bg-purple-700 transition-colors"
+                >
+                  {isPlaying ? <PauseIcon /> : <PlayIcon />}
+                  <span>{isPlaying ? 'Pause' : 'Play with Dialogue'}</span>
+                </button>
+              </div>
             )}
+
 
             <div className="flex flex-col sm:flex-row gap-4">
               <button
-                onClick={handleGenerateSound}
+                onClick={handleGenerateDialogue}
                 disabled={isLoading || !videoFile || retryAfter > 0}
                 className="w-full flex-grow bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-600 hover:to-indigo-700 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition-transform transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100"
               >
@@ -272,12 +342,12 @@ export default function App() {
                   ? 'Generating...'
                   : retryAfter > 0
                   ? `Try again in ${retryAfter}s`
-                  : generatedAudioBuffer
-                  ? '✨ Regenerate Sound'
-                  : '✨ Generate Sound'}
+                  : generatedAudioUrl
+                  ? '✨ Regenerate Dialogue'
+                  : '✨ Generate Dialogue'}
               </button>
 
-              {generatedAudioBuffer && !isLoading && (
+              {generatedAudioUrl && !isLoading && (
                 <button
                   onClick={handleDownload}
                   className="w-full sm:w-auto flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-colors"

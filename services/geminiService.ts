@@ -1,5 +1,4 @@
 import { GoogleGenAI, Modality } from "@google/genai";
-import { soundEffects } from './soundEffects';
 
 const API_KEY = process.env.API_KEY;
 
@@ -9,13 +8,23 @@ if (!API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
+export interface DialogueLine {
+  time: number;
+  speaker: string;
+  age: string;
+  gender: string;
+  performanceCue: string;
+  text: string;
+}
+
 /**
- * Generates a textual description of sounds for a given video.
+ * Acts as an expert lip-reader and director to generate a plausible, time-stamped script of dialogue from a video.
  * @param videoBase64 The base64 encoded video string.
  * @param mimeType The MIME type of the video.
- * @returns A promise that resolves to the sound description string.
+ * @param guidance Optional user-provided guidance for the dialogue's tone or context.
+ * @returns A promise that resolves to a full dialogue script.
  */
-export async function generateSoundDescription(videoBase64: string, mimeType: string): Promise<string> {
+export async function generateDialogueScript(videoBase64: string, mimeType: string, guidance: string): Promise<string> {
   const model = "gemini-2.5-flash";
   const videoPart = {
     inlineData: {
@@ -23,104 +32,85 @@ export async function generateSoundDescription(videoBase64: string, mimeType: st
       mimeType: mimeType,
     },
   };
+
+  const guidanceText = guidance.trim() !== ''
+    ? `The user has provided this guidance for the dialogue's tone and context: '${guidance}'. Please adhere to this guidance when generating dialogue and performance cues.`
+    : 'Infer the context, tone, and emotion from the video itself.';
+  
   const textPart = {
-    text: `Analyze this video and provide a detailed script of sounds that should accompany it, formatted for a text-to-speech engine. 
-    Describe the sounds, noises, or voices that would fit the scene.
-    For example: 'A gentle breeze rustles through the leaves. A small bird chirps happily. Suddenly, a deep voice says, "It is time."'
-    Be creative, descriptive, and keep the total description concise and under 100 words.`
+    text: `Your task is to be an expert phonetician, lip reader, and script director. You will generate a perfectly synchronized dialogue script from the video with performance cues.
+
+    **Your single most important goal is to generate words that phonetically match the visual evidence of the characters' mouth movements.** Do not try to make the dialogue make sense or be coherent. Absurd or nonsensical sentences are perfectly acceptable if they provide a better phonetic match to the lip sync.
+
+    **Instructions:**
+    1.  Focus **only on dialogue**. Ignore all other ambient sounds (wind, traffic) or foley sounds (footsteps, doors).
+    2.  Analyze mouth movements phonetically (Stops: p,b,t,d; Fricatives: f,v,s,z; Vowels: open shapes, etc.).
+    3.  You MUST infer the perceived age (e.g., Child, Teenager, Adult, Senior) and gender (e.g., Male, Female) of each speaker.
+    4.  You MUST include a performance cue in brackets \`[]\` after the character description, describing the emotion or intonation (e.g., \`[shouting]\`, \`[whispering]\`, \`[sadly]\`, \`[excitedly]\`).
+    5.  Timestamp everything precisely to the millisecond.
+    6.  Vocalizations like laughing, crying, coughing should be described like \`*laughs heartily*\`.
+    7.  If multiple speakers talk at once, create separate lines for each with their respective start times.
+    8.  If there are periods of silence where no one is speaking, do not generate any script lines for those times.
+
+    **Output Format:**
+    \`[START_SECONDS.MILLISECONDS] DIALOGUE: Speaker #: (Age, Gender) [Performance Cue] Dialogue_or_Vocalization\`
+
+    **Example Output:**
+    [2.350] DIALOGUE: Speaker 1: (Child, Male) [curiously] Pop goes the pebble.
+    [5.120] DIALOGUE: Speaker 2: (Adult, Female) [laughing softly] You think so?
+    [8.750] DIALOGUE: Speaker 1: (Child, Male) [shouting excitedly] I found it!
+
+    ${guidanceText}`
   };
   
   const response = await ai.models.generateContent({
     model: model,
-    contents: { parts: [textPart, videoPart] },
+    contents: [{ parts: [textPart, videoPart] }],
   });
 
   if (!response.text) {
-    throw new Error("Failed to generate sound description from video.");
+    throw new Error("Failed to generate dialogue script from video.");
   }
 
-  return response.text;
+  return response.text.trim();
 }
 
 /**
- * Generates audio from a given text description.
- * @param description The text to convert to speech.
- * @param voiceName The name of the pre-built voice to use.
- * @returns A promise that resolves to the base64 encoded audio string.
+ * Generates audio for a single line of dialogue using performance cues.
+ * @param line The parsed dialogue line object from the script.
+ * @returns A promise that resolves to the base64 encoded audio string, or null if generation fails.
  */
-export async function generateAudioFromText(description: string, voiceName: string): Promise<string> {
+export async function generateAudioForDialogueLine(line: DialogueLine): Promise<string | null> {
   const model = "gemini-2.5-flash-preview-tts";
   
-  const response = await ai.models.generateContent({
-    model: model,
-    contents: [{ parts: [{ text: description }] }],
-    config: {
-      responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: voiceName },
-        },
-      },
-    },
-  });
+  const ttsPrompt = `As a voice actor performing as a ${line.age.toLowerCase()} ${line.gender.toLowerCase()}, ${line.performanceCue}, perform this sound or line: "${line.text}"`;
 
-  const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-  if (!audioData) {
-    throw new Error("Failed to generate audio from text.");
-  }
-
-  return audioData;
-}
-
-/**
- * Analyzes a video and suggests relevant sound effects from a predefined list.
- * @param videoBase64 The base64 encoded video string.
- * @param mimeType The MIME type of the video.
- * @returns A promise that resolves to an array of sound effect IDs.
- */
-export async function suggestSoundEffects(videoBase64: string, mimeType: string): Promise<string[]> {
-  const model = "gemini-2.5-flash";
-
-  const effectsDescription = soundEffects.map(e => `- ${e.id}: ${e.description}`).join('\n');
-
-  const videoPart = {
-    inlineData: {
-      data: videoBase64,
-      mimeType: mimeType,
-    },
-  };
-
-  const textPart = {
-    text: `Analyze this video's content and mood. Based on your analysis, suggest which of the following sound effects would be most appropriate to add to a soundtrack.
-
-Available sound effects:
-${effectsDescription}
-
-Respond ONLY with a valid JSON array of the string IDs for your suggestions. For example: ["rumble", "static"]. If no effects are suitable, return an empty array [].`
-  };
-  
-  const response = await ai.models.generateContent({
-    model: model,
-    contents: { parts: [textPart, videoPart] },
-    config: {
-      responseMimeType: 'application/json',
-    }
-  });
-
-  if (!response.text) {
-    throw new Error("Failed to get a response for sound effect suggestions.");
-  }
+  const voiceName = 'Kore'; 
 
   try {
-    const suggestions = JSON.parse(response.text);
-    if (Array.isArray(suggestions) && suggestions.every(item => typeof item === 'string')) {
-      const validIds = soundEffects.map(e => e.id);
-      return suggestions.filter(id => validIds.includes(id));
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: [{ parts: [{ text: ttsPrompt }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voiceName as any },
+          },
+        },
+      },
+    });
+
+    const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+    if (!audioData) {
+      console.warn(`Could not generate audio for line: "${line.text}". Skipping.`);
+      return null;
     }
-    throw new Error("Model returned an invalid format for suggestions.");
-  } catch (e) {
-    console.error("Failed to parse sound effect suggestions:", response.text, e);
-    throw new Error("Failed to parse sound effect suggestions from the AI. Please try again.");
+
+    return audioData;
+  } catch (error) {
+    console.error(`An API error occurred while generating audio for line: "${line.text}"`, error);
+    return null;
   }
 }
